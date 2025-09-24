@@ -11,6 +11,18 @@
 (define-constant ERR-INSUFFICIENT-BALANCE (err u1006))
 (define-constant ERR-INVALID-MATURITY (err u1007))
 (define-constant ERR-TRANSFER-FAILED (err u1008))
+(define-constant ERR-ACHIEVEMENT-NOT-FOUND (err u1009))
+(define-constant ERR-ACHIEVEMENT-ALREADY-UNLOCKED (err u1010))
+(define-constant ERR-INSUFFICIENT-PROGRESS (err u1011))
+(define-constant ERR-CONTENT-LOCKED (err u1012))
+(define-constant ERR-INVALID-LESSON (err u1013))
+
+(define-constant ACHIEVEMENT-REWARD-BASE u10)
+(define-constant EDUCATIONAL-BONUS-MULTIPLIER u150)
+(define-constant MAX-LESSON-LEVEL u10)
+(define-constant MILESTONE-THRESHOLD-1 u100000)
+(define-constant MILESTONE-THRESHOLD-2 u500000)
+(define-constant MILESTONE-THRESHOLD_3 u1000000)
 
 (define-constant BLOCKS-PER-YEAR u52560)
 (define-constant MIN-MATURITY-YEARS u1)
@@ -20,6 +32,8 @@
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-accounts uint u0)
 (define-data-var total-deposits uint u0)
+(define-data-var total-achievements-unlocked uint u0)
+(define-data-var next-achievement-id uint u1)
 
 (define-map savings-accounts
   { child: principal }
@@ -47,6 +61,147 @@
 (define-map transaction-counters
   { child: principal }
   { count: uint }
+)
+
+(define-map learning-achievements
+  { achievement-id: uint }
+  {
+    name: (string-ascii 50),
+    description: (string-ascii 200),
+    achievement-type: (string-ascii 20),
+    threshold-amount: uint,
+    reward-tokens: uint,
+    educational-content: (string-ascii 300),
+    unlock-level: uint,
+    active: bool
+  }
+)
+
+(define-map child-achievements
+  { child: principal, achievement-id: uint }
+  {
+    unlocked-at: uint,
+    reward-claimed: bool,
+    progress-percent: uint
+  }
+)
+
+(define-map educational-progress
+  { child: principal }
+  {
+    total-saved: uint,
+    savings-streak: uint,
+    lessons-completed: uint,
+    current-level: uint,
+    total-achievements: uint,
+    learning-points: uint,
+    last-activity: uint
+  }
+)
+
+(define-map financial-lessons
+  { lesson-id: uint }
+  {
+    title: (string-ascii 60),
+    content: (string-ascii 400),
+    lesson-type: (string-ascii 20),
+    required-level: uint,
+    reward-points: uint,
+    completion-threshold: uint
+  }
+)
+
+(define-map lesson-completion
+  { child: principal, lesson-id: uint }
+  {
+    completed-at: uint,
+    score: uint,
+    points-earned: uint
+  }
+)
+
+(define-read-only (get-learning-achievement (achievement-id uint))
+  (map-get? learning-achievements { achievement-id: achievement-id })
+)
+
+(define-read-only (get-child-achievement (child principal) (achievement-id uint))
+  (map-get? child-achievements { child: child, achievement-id: achievement-id })
+)
+
+(define-read-only (get-child-educational-progress (child principal))
+  (get-educational-progress child)
+)
+
+(define-read-only (get-financial-lesson (lesson-id uint))
+  (map-get? financial-lessons { lesson-id: lesson-id })
+)
+
+(define-read-only (get-lesson-completion (child principal) (lesson-id uint))
+  (map-get? lesson-completion { child: child, lesson-id: lesson-id })
+)
+
+(define-read-only (get-child-learning-summary (child principal))
+  (let ((progress-data (get-educational-progress child)))
+    (ok {
+      current-level: (get current-level progress-data),
+      total-achievements: (get total-achievements progress-data),
+      lessons-completed: (get lessons-completed progress-data),
+      learning-points: (get learning-points progress-data),
+      savings-streak: (get savings-streak progress-data),
+      next-level-threshold: (get-next-level-threshold (get current-level progress-data))
+    })
+  )
+)
+
+(define-read-only (check-achievement-eligibility (child principal) (achievement-id uint))
+  (let 
+    (
+      (achievement-data (map-get? learning-achievements { achievement-id: achievement-id }))
+      (progress-data (get-educational-progress child))
+      (existing-unlock (map-get? child-achievements { child: child, achievement-id: achievement-id }))
+    )
+    (match achievement-data
+      achievement
+      (ok {
+        eligible: (and 
+          (is-none existing-unlock)
+          (get active achievement)
+          (>= (get current-level progress-data) (get unlock-level achievement))
+          (>= (calculate-achievement-progress child achievement-id) u100)
+        ),
+        progress-percent: (calculate-achievement-progress child achievement-id),
+        required-level: (get unlock-level achievement),
+        current-level: (get current-level progress-data)
+      })
+      ERR-ACHIEVEMENT-NOT-FOUND
+    )
+  )
+)
+
+(define-read-only (get-available-lessons (child principal))
+  (let ((progress-data (get-educational-progress child)))
+    (ok {
+      current-level: (get current-level progress-data),
+      available-lesson-ids: (list u1 u2 u3 u4 u5),
+      completed-lessons: (get lessons-completed progress-data)
+    })
+  )
+)
+
+(define-read-only (get-educational-stats)
+  {
+    total-achievements-unlocked: (var-get total-achievements-unlocked),
+    next-achievement-id: (var-get next-achievement-id)
+  }
+)
+
+(define-private (get-next-level-threshold (current-level uint))
+  (if (is-eq current-level u1) u10000
+    (if (is-eq current-level u2) u50000
+      (if (< current-level u5) MILESTONE-THRESHOLD-1
+        (if (< current-level u7) MILESTONE-THRESHOLD-2
+          (if (< current-level u10) MILESTONE-THRESHOLD_3
+            u2000000)))))
 )
 
 (define-read-only (get-contract-owner)
@@ -157,7 +312,284 @@
   )
 )
 
-(define-public (create-savings-account 
+(define-public (create-learning-achievement
+  (name (string-ascii 50))
+  (description (string-ascii 200))
+  (achievement-type (string-ascii 20))
+  (threshold-amount uint)
+  (reward-tokens uint)
+  (educational-content (string-ascii 300))
+  (unlock-level uint)
+)
+  (let ((achievement-id (var-get next-achievement-id)))
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (> threshold-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (> reward-tokens u0) ERR-INVALID-AMOUNT)
+    (asserts! (<= unlock-level MAX-LESSON-LEVEL) ERR-INVALID-LESSON)
+    
+    (map-set learning-achievements
+      { achievement-id: achievement-id }
+      {
+        name: name,
+        description: description,
+        achievement-type: achievement-type,
+        threshold-amount: threshold-amount,
+        reward-tokens: reward-tokens,
+        educational-content: educational-content,
+        unlock-level: unlock-level,
+        active: true
+      })
+    
+    (var-set next-achievement-id (+ achievement-id u1))
+    (ok achievement-id)
+  )
+)
+
+(define-public (unlock-achievement (child principal) (achievement-id uint))
+  (let 
+    (
+      (achievement-data (unwrap! (map-get? learning-achievements { achievement-id: achievement-id }) ERR-ACHIEVEMENT-NOT-FOUND))
+      (progress-data (get-educational-progress child))
+      (existing-unlock (map-get? child-achievements { child: child, achievement-id: achievement-id }))
+    )
+    (asserts! (is-none existing-unlock) ERR-ACHIEVEMENT-ALREADY-UNLOCKED)
+    (asserts! (get active achievement-data) ERR-ACHIEVEMENT-NOT-FOUND)
+    (asserts! (>= (get current-level progress-data) (get unlock-level achievement-data)) ERR-INSUFFICIENT-PROGRESS)
+    
+    (let 
+      (
+        (account-data (unwrap! (map-get? savings-accounts { child: child }) ERR-ACCOUNT-NOT-FOUND))
+        (progress-percent (calculate-achievement-progress child achievement-id))
+        (reward-amount (get reward-tokens achievement-data))
+      )
+      (asserts! (>= progress-percent u100) ERR-INSUFFICIENT-PROGRESS)
+      
+      (begin
+        (map-set child-achievements
+          { child: child, achievement-id: achievement-id }
+          {
+            unlocked-at: stacks-block-height,
+            reward-claimed: false,
+            progress-percent: progress-percent
+          })
+        
+        (map-set savings-accounts
+          { child: child }
+          (merge account-data { balance: (+ (get balance account-data) reward-amount) }))
+        
+        (unwrap-panic (update-educational-progress child "achievement-unlocked" reward-amount))
+        (var-set total-achievements-unlocked (+ (var-get total-achievements-unlocked) u1))
+        
+        (unwrap-panic (add-transaction-record child reward-amount "achievement-reward" (get name achievement-data)))
+        
+        (ok {
+          achievement-name: (get name achievement-data),
+          reward-earned: reward-amount,
+          educational-content: (get educational-content achievement-data)
+        })
+      )
+    )
+  )
+)
+
+(define-public (complete-financial-lesson (child principal) (lesson-id uint) (score uint))
+  (let 
+    (
+      (lesson-data (unwrap! (map-get? financial-lessons { lesson-id: lesson-id }) ERR-INVALID-LESSON))
+      (progress-data (get-educational-progress child))
+      (existing-completion (map-get? lesson-completion { child: child, lesson-id: lesson-id }))
+    )
+    (asserts! (is-none existing-completion) ERR-ACHIEVEMENT-ALREADY-UNLOCKED)
+    (asserts! (>= (get current-level progress-data) (get required-level lesson-data)) ERR-CONTENT-LOCKED)
+    (asserts! (>= score (get completion-threshold lesson-data)) ERR-INSUFFICIENT-PROGRESS)
+    
+    (let 
+      (
+        (account-data (unwrap! (map-get? savings-accounts { child: child }) ERR-ACCOUNT-NOT-FOUND))
+        (points-earned (get reward-points lesson-data))
+        (bonus-amount (/ (* points-earned ACHIEVEMENT-REWARD-BASE) u100))
+      )
+      (begin
+        (map-set lesson-completion
+          { child: child, lesson-id: lesson-id }
+          {
+            completed-at: stacks-block-height,
+            score: score,
+            points-earned: points-earned
+          })
+        
+        (map-set savings-accounts
+          { child: child }
+          (merge account-data { balance: (+ (get balance account-data) bonus-amount) }))
+        
+        (unwrap-panic (update-educational-progress child "lesson-completed" points-earned))
+        
+        (unwrap-panic (add-transaction-record child bonus-amount "lesson-reward" (get title lesson-data)))
+        
+        (ok {
+          lesson-title: (get title lesson-data),
+          score-achieved: score,
+          points-earned: points-earned,
+          bonus-amount: bonus-amount
+        })
+      )
+    )
+  )
+)
+
+(define-public (create-financial-lesson
+  (lesson-id uint)
+  (title (string-ascii 60))
+  (content (string-ascii 400))
+  (lesson-type (string-ascii 20))
+  (required-level uint)
+  (reward-points uint)
+  (completion-threshold uint)
+)
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (<= required-level MAX-LESSON-LEVEL) ERR-INVALID-LESSON)
+    (asserts! (> reward-points u0) ERR-INVALID-AMOUNT)
+    (asserts! (<= completion-threshold u100) ERR-INVALID-AMOUNT)
+    
+    (map-set financial-lessons
+      { lesson-id: lesson-id }
+      {
+        title: title,
+        content: content,
+        lesson-type: lesson-type,
+        required-level: required-level,
+        reward-points: reward-points,
+        completion-threshold: completion-threshold
+      })
+    
+    (ok lesson-id)
+  )
+)
+
+(define-public (grant-educational-bonus (child principal) (bonus-amount uint) (reason (string-ascii 50)))
+  (let ((account-data (unwrap! (map-get? savings-accounts { child: child }) ERR-ACCOUNT-NOT-FOUND)))
+    (asserts! (is-eq tx-sender (get parent account-data)) ERR-NOT-AUTHORIZED)
+    (asserts! (> bonus-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (get is-active account-data) ERR-NOT-AUTHORIZED)
+    
+    (begin
+      (try! (stx-transfer? bonus-amount tx-sender (as-contract tx-sender)))
+      
+      (map-set savings-accounts
+        { child: child }
+        (merge account-data { balance: (+ (get balance account-data) bonus-amount) }))
+      
+      (unwrap-panic (update-educational-progress child "educational-bonus" bonus-amount))
+      (var-set total-deposits (+ (var-get total-deposits) bonus-amount))
+      
+      (unwrap-panic (add-transaction-record child bonus-amount "educational-bonus" reason))
+      
+      (ok {
+        bonus-granted: bonus-amount,
+        reason: reason,
+        new-balance: (+ (get balance account-data) bonus-amount)
+      })
+    )
+  )
+)
+
+(define-private (update-educational-progress (child principal) (activity-type (string-ascii 20)) (amount uint))
+  (let 
+    (
+      (current-progress (get-educational-progress child))
+      (new-total-saved (+ (get total-saved current-progress) amount))
+      (new-level (calculate-learning-level new-total-saved))
+      (points-earned (calculate-learning-points activity-type amount))
+    )
+    (map-set educational-progress
+      { child: child }
+      {
+        total-saved: new-total-saved,
+        savings-streak: (calculate-savings-streak child),
+        lessons-completed: (if (is-eq activity-type "lesson-completed") 
+                            (+ (get lessons-completed current-progress) u1)
+                            (get lessons-completed current-progress)),
+        current-level: new-level,
+        total-achievements: (if (is-eq activity-type "achievement-unlocked")
+                             (+ (get total-achievements current-progress) u1)
+                             (get total-achievements current-progress)),
+        learning-points: (+ (get learning-points current-progress) points-earned),
+        last-activity: stacks-block-height
+      })
+    (ok true)
+  )
+)
+
+(define-private (calculate-achievement-progress (child principal) (achievement-id uint))
+  (let 
+    (
+      (achievement-data (map-get? learning-achievements { achievement-id: achievement-id }))
+      (account-data (map-get? savings-accounts { child: child }))
+    )
+    (match achievement-data
+      achievement
+      (match account-data
+        account
+        (let 
+          (
+            (current-balance (get balance account))
+            (threshold (get threshold-amount achievement))
+          )
+          (if (>= current-balance threshold)
+            u100
+            (/ (* current-balance u100) threshold))
+        )
+        u0)
+      u0)
+  )
+)
+
+(define-private (calculate-learning-level (total-saved uint))
+  (if (>= total-saved MILESTONE-THRESHOLD_3) u10
+    (if (>= total-saved MILESTONE-THRESHOLD-2) u7
+      (if (>= total-saved MILESTONE-THRESHOLD-1) u5
+        (if (>= total-saved u50000) u3
+          (if (>= total-saved u10000) u2 u1))))))
+
+(define-private (calculate-learning-points (activity-type (string-ascii 20)) (amount uint))
+  (if (is-eq activity-type "deposit")
+    (/ amount u1000)
+    (if (is-eq activity-type "lesson-completed")
+      amount
+      (if (is-eq activity-type "achievement-unlocked")
+        (* amount u2)
+        u0))))
+
+(define-private (calculate-savings-streak (child principal))
+  (let 
+    (
+      (account-data (unwrap! (map-get? savings-accounts { child: child }) u0))
+      (current-progress (get-educational-progress child))
+      (blocks-since-last (- stacks-block-height (get last-activity current-progress)))
+    )
+    (if (<= blocks-since-last u1440)
+      (+ (get savings-streak current-progress) u1)
+      u1)
+  )
+)
+
+(define-private (get-educational-progress (child principal))
+  (default-to
+    {
+      total-saved: u0,
+      savings-streak: u0,
+      lessons-completed: u0,
+      current-level: u1,
+      total-achievements: u0,
+      learning-points: u0,
+      last-activity: stacks-block-height
+    }
+    (map-get? educational-progress { child: child })
+  )
+)
+
+(define-public (create-savings-account
     (child principal) 
     (maturity-years uint) 
     (goal-amount uint) 
@@ -207,6 +639,7 @@
     
     (var-set total-deposits (+ (var-get total-deposits) amount))
     (unwrap-panic (add-transaction-record child amount "deposit" "Parent deposit"))
+    (unwrap-panic (update-educational-progress child "deposit" amount))
     
     (ok {
       new-balance: (+ (get balance account-data) amount),
