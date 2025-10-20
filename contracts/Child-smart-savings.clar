@@ -16,6 +16,8 @@
 (define-constant ERR-INSUFFICIENT-PROGRESS (err u1011))
 (define-constant ERR-CONTENT-LOCKED (err u1012))
 (define-constant ERR-INVALID-LESSON (err u1013))
+(define-constant ERR-INTEREST-ALREADY-CLAIMED (err u1014))
+(define-constant ERR-NO-INTEREST-ACCRUED (err u1015))
 
 (define-constant ACHIEVEMENT-REWARD-BASE u10)
 (define-constant EDUCATIONAL-BONUS-MULTIPLIER u150)
@@ -28,12 +30,18 @@
 (define-constant MIN-MATURITY-YEARS u1)
 (define-constant MAX-MATURITY-YEARS u25)
 (define-constant EMERGENCY-PENALTY-PERCENT u10)
+(define-constant INTEREST-RATE-TIER1 u200)
+(define-constant INTEREST-RATE-TIER2 u350)
+(define-constant INTEREST-RATE-TIER3 u500)
+(define-constant INTEREST-CALCULATION-BLOCKS u52560)
+(define-constant INTEREST-CLAIM-COOLDOWN u1440)
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-accounts uint u0)
 (define-data-var total-deposits uint u0)
 (define-data-var total-achievements-unlocked uint u0)
 (define-data-var next-achievement-id uint u1)
+(define-data-var total-interest-paid uint u0)
 
 (define-map savings-accounts
   { child: principal }
@@ -117,6 +125,16 @@
     completed-at: uint,
     score: uint,
     points-earned: uint
+  }
+)
+
+(define-map interest-tracking
+  { child: principal }
+  {
+    last-claim-block: uint,
+    total-interest-earned: uint,
+    interest-tier: uint,
+    compound-start-block: uint
   }
 )
 
@@ -926,4 +944,190 @@
     contract-owner: (var-get contract-owner),
     current-block: stacks-block-height
   }
+)
+
+(define-read-only (get-interest-info (child principal))
+  (map-get? interest-tracking { child: child })
+)
+
+(define-read-only (calculate-interest-tier (maturity-years uint))
+  (if (>= maturity-years u10) u3
+    (if (>= maturity-years u5) u2 u1))
+)
+
+(define-read-only (get-interest-rate (tier uint))
+  (if (is-eq tier u3) INTEREST-RATE-TIER3
+    (if (is-eq tier u2) INTEREST-RATE-TIER2 INTEREST-RATE-TIER1))
+)
+
+(define-read-only (calculate-accrued-interest (child principal))
+  (match (map-get? savings-accounts { child: child })
+    account-data
+      (let 
+        (
+          (interest-data (default-to 
+            { last-claim-block: (get created-at account-data), total-interest-earned: u0, interest-tier: u1, compound-start-block: (get created-at account-data) }
+            (map-get? interest-tracking { child: child })))
+          (current-balance (get balance account-data))
+          (blocks-elapsed (- stacks-block-height (get last-claim-block interest-data)))
+          (interest-rate (get-interest-rate (get interest-tier interest-data)))
+          (interest-amount (/ (* (* current-balance interest-rate) blocks-elapsed) (* u10000 INTEREST-CALCULATION-BLOCKS)))
+        )
+        (ok {
+          accrued-interest: interest-amount,
+          current-balance: current-balance,
+          blocks-since-last-claim: blocks-elapsed,
+          interest-rate: interest-rate,
+          interest-tier: (get interest-tier interest-data),
+          can-claim: (>= blocks-elapsed INTEREST-CLAIM-COOLDOWN)
+        })
+      )
+    ERR-ACCOUNT-NOT-FOUND
+  )
+)
+
+(define-read-only (get-interest-projection (child principal) (future-blocks uint))
+  (match (map-get? savings-accounts { child: child })
+    account-data
+      (let 
+        (
+          (interest-data (default-to 
+            { last-claim-block: (get created-at account-data), total-interest-earned: u0, interest-tier: u1, compound-start-block: (get created-at account-data) }
+            (map-get? interest-tracking { child: child })))
+          (current-balance (get balance account-data))
+          (interest-rate (get-interest-rate (get interest-tier interest-data)))
+          (projected-interest (/ (* (* current-balance interest-rate) future-blocks) (* u10000 INTEREST-CALCULATION-BLOCKS)))
+        )
+        (ok {
+          current-balance: current-balance,
+          projected-interest: projected-interest,
+          future-balance: (+ current-balance projected-interest),
+          blocks-projected: future-blocks,
+          annual-rate: interest-rate
+        })
+      )
+    ERR-ACCOUNT-NOT-FOUND
+  )
+)
+
+(define-read-only (get-compound-stats (child principal))
+  (match (map-get? savings-accounts { child: child })
+    account-data
+      (match (map-get? interest-tracking { child: child })
+        interest-data
+        (ok {
+          total-interest-earned: (get total-interest-earned interest-data),
+          interest-tier: (get interest-tier interest-data),
+          compound-duration: (- stacks-block-height (get compound-start-block interest-data)),
+          last-claim-block: (get last-claim-block interest-data),
+          next-claim-available: (+ (get last-claim-block interest-data) INTEREST-CLAIM-COOLDOWN)
+        })
+        (ok {
+          total-interest-earned: u0,
+          interest-tier: u1,
+          compound-duration: u0,
+          last-claim-block: (get created-at account-data),
+          next-claim-available: (+ (get created-at account-data) INTEREST-CLAIM-COOLDOWN)
+        })
+      )
+    ERR-ACCOUNT-NOT-FOUND
+  )
+)
+
+(define-public (initialize-interest-account (child principal))
+  (let 
+    (
+      (account-data (unwrap! (map-get? savings-accounts { child: child }) ERR-ACCOUNT-NOT-FOUND))
+      (existing-interest (map-get? interest-tracking { child: child }))
+      (years-to-maturity (/ (- (get maturity-block account-data) stacks-block-height) BLOCKS-PER-YEAR))
+      (interest-tier (calculate-interest-tier years-to-maturity))
+    )
+    (asserts! (is-eq tx-sender (get parent account-data)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-none existing-interest) ERR-ACCOUNT-EXISTS)
+    (asserts! (get is-active account-data) ERR-NOT-AUTHORIZED)
+    
+    (map-set interest-tracking
+      { child: child }
+      {
+        last-claim-block: stacks-block-height,
+        total-interest-earned: u0,
+        interest-tier: interest-tier,
+        compound-start-block: stacks-block-height
+      })
+    
+    (unwrap-panic (add-transaction-record child u0 "interest-enabled" "Compound interest activated"))
+    
+    (ok {
+      interest-tier: interest-tier,
+      annual-rate: (get-interest-rate interest-tier),
+      compound-start-block: stacks-block-height
+    })
+  )
+)
+
+(define-public (claim-interest (child principal))
+  (let 
+    (
+      (account-data (unwrap! (map-get? savings-accounts { child: child }) ERR-ACCOUNT-NOT-FOUND))
+      (interest-data (unwrap! (map-get? interest-tracking { child: child }) ERR-ACCOUNT-NOT-FOUND))
+      (blocks-elapsed (- stacks-block-height (get last-claim-block interest-data)))
+      (interest-calculation (unwrap! (calculate-accrued-interest child) ERR-NO-INTEREST-ACCRUED))
+      (interest-amount (get accrued-interest interest-calculation))
+    )
+    (asserts! (or (is-eq tx-sender (get parent account-data)) (is-eq tx-sender child)) ERR-NOT-AUTHORIZED)
+    (asserts! (get is-active account-data) ERR-NOT-AUTHORIZED)
+    (asserts! (>= blocks-elapsed INTEREST-CLAIM-COOLDOWN) ERR-INTEREST-ALREADY-CLAIMED)
+    (asserts! (> interest-amount u0) ERR-NO-INTEREST-ACCRUED)
+    
+    (map-set savings-accounts
+      { child: child }
+      (merge account-data { balance: (+ (get balance account-data) interest-amount) }))
+    
+    (map-set interest-tracking
+      { child: child }
+      {
+        last-claim-block: stacks-block-height,
+        total-interest-earned: (+ (get total-interest-earned interest-data) interest-amount),
+        interest-tier: (get interest-tier interest-data),
+        compound-start-block: (get compound-start-block interest-data)
+      })
+    
+    (var-set total-interest-paid (+ (var-get total-interest-paid) interest-amount))
+    (unwrap-panic (add-transaction-record child interest-amount "interest-claimed" "Compound interest added"))
+    
+    (ok {
+      interest-earned: interest-amount,
+      new-balance: (+ (get balance account-data) interest-amount),
+      total-lifetime-interest: (+ (get total-interest-earned interest-data) interest-amount)
+    })
+  )
+)
+
+(define-public (upgrade-interest-tier (child principal))
+  (let 
+    (
+      (account-data (unwrap! (map-get? savings-accounts { child: child }) ERR-ACCOUNT-NOT-FOUND))
+      (interest-data (unwrap! (map-get? interest-tracking { child: child }) ERR-ACCOUNT-NOT-FOUND))
+      (years-to-maturity (/ (- (get maturity-block account-data) stacks-block-height) BLOCKS-PER-YEAR))
+      (new-tier (calculate-interest-tier years-to-maturity))
+      (current-tier (get interest-tier interest-data))
+    )
+    (asserts! (is-eq tx-sender (get parent account-data)) ERR-NOT-AUTHORIZED)
+    (asserts! (get is-active account-data) ERR-NOT-AUTHORIZED)
+    (asserts! (> new-tier current-tier) ERR-INVALID-AMOUNT)
+    
+    (try! (claim-interest child))
+    
+    (map-set interest-tracking
+      { child: child }
+      (merge interest-data { interest-tier: new-tier }))
+    
+    (unwrap-panic (add-transaction-record child u0 "tier-upgraded" "Interest tier upgraded"))
+    
+    (ok {
+      old-tier: current-tier,
+      new-tier: new-tier,
+      new-rate: (get-interest-rate new-tier)
+    })
+  )
 )
