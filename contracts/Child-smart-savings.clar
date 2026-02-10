@@ -18,6 +18,8 @@
 (define-constant ERR-INVALID-LESSON (err u1013))
 (define-constant ERR-INTEREST-ALREADY-CLAIMED (err u1014))
 (define-constant ERR-NO-INTEREST-ACCRUED (err u1015))
+(define-constant ERR-INVALID-MESSAGE (err u1016))
+(define-constant ERR-GIFTING-DISABLED (err u1017))
 
 (define-constant ACHIEVEMENT-REWARD-BASE u10)
 (define-constant EDUCATIONAL-BONUS-MULTIPLIER u150)
@@ -25,6 +27,8 @@
 (define-constant MILESTONE-THRESHOLD-1 u100000)
 (define-constant MILESTONE-THRESHOLD-2 u500000)
 (define-constant MILESTONE-THRESHOLD_3 u1000000)
+
+(define-constant MAX-GIFT-MESSAGE-LENGTH u100)
 
 (define-constant BLOCKS-PER-YEAR u52560)
 (define-constant MIN-MATURITY-YEARS u1)
@@ -42,6 +46,7 @@
 (define-data-var total-achievements-unlocked uint u0)
 (define-data-var next-achievement-id uint u1)
 (define-data-var total-interest-paid uint u0)
+(define-data-var total-gifts-received uint u0)
 
 (define-map savings-accounts
   { child: principal }
@@ -136,6 +141,26 @@
     interest-tier: uint,
     compound-start-block: uint
   }
+)
+
+(define-map gift-deposits
+  { child: principal, gift-id: uint }
+  {
+    gifter: principal,
+    amount: uint,
+    message: (string-ascii 100),
+    gifted-at: uint
+  }
+)
+
+(define-map gift-counters
+  { child: principal }
+  { count: uint, total-gifted: uint }
+)
+
+(define-map gift-settings
+  { child: principal }
+  { gifting-enabled: bool }
 )
 
 (define-read-only (get-learning-achievement (achievement-id uint))
@@ -1130,4 +1155,82 @@
       new-rate: (get-interest-rate new-tier)
     })
   )
+)
+
+(define-public (toggle-gifting (child principal) (enabled bool))
+  (let ((account-data (unwrap! (map-get? savings-accounts { child: child }) ERR-ACCOUNT-NOT-FOUND)))
+    (asserts! (is-eq tx-sender (get parent account-data)) ERR-NOT-AUTHORIZED)
+    (asserts! (get is-active account-data) ERR-NOT-AUTHORIZED)
+    
+    (map-set gift-settings
+      { child: child }
+      { gifting-enabled: enabled })
+    
+    (ok { child: child, gifting-enabled: enabled })
+  )
+)
+
+(define-public (send-gift (child principal) (amount uint) (message (string-ascii 100)))
+  (let 
+    (
+      (account-data (unwrap! (map-get? savings-accounts { child: child }) ERR-ACCOUNT-NOT-FOUND))
+      (settings (default-to { gifting-enabled: true } (map-get? gift-settings { child: child })))
+      (gift-data (default-to { count: u0, total-gifted: u0 } (map-get? gift-counters { child: child })))
+      (gift-id (get count gift-data))
+    )
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (get is-active account-data) ERR-NOT-AUTHORIZED)
+    (asserts! (get gifting-enabled settings) ERR-GIFTING-DISABLED)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set savings-accounts
+      { child: child }
+      (merge account-data { balance: (+ (get balance account-data) amount) }))
+    
+    (map-set gift-deposits
+      { child: child, gift-id: gift-id }
+      {
+        gifter: tx-sender,
+        amount: amount,
+        message: message,
+        gifted-at: stacks-block-height
+      })
+    
+    (map-set gift-counters
+      { child: child }
+      { count: (+ gift-id u1), total-gifted: (+ (get total-gifted gift-data) amount) })
+    
+    (var-set total-deposits (+ (var-get total-deposits) amount))
+    (var-set total-gifts-received (+ (var-get total-gifts-received) amount))
+    (unwrap-panic (add-transaction-record child amount "gift-deposit" "Gift received"))
+    (unwrap-panic (update-educational-progress child "deposit" amount))
+    
+    (ok {
+      gift-id: gift-id,
+      amount: amount,
+      new-balance: (+ (get balance account-data) amount),
+      gifter: tx-sender
+    })
+  )
+)
+
+(define-read-only (get-gift (child principal) (gift-id uint))
+  (map-get? gift-deposits { child: child, gift-id: gift-id })
+)
+
+(define-read-only (get-gift-summary (child principal))
+  (let ((gift-data (default-to { count: u0, total-gifted: u0 } (map-get? gift-counters { child: child }))))
+    (ok {
+      total-gifts: (get count gift-data),
+      total-gifted-amount: (get total-gifted gift-data),
+      gifting-enabled: (get gifting-enabled (default-to { gifting-enabled: true } (map-get? gift-settings { child: child })))
+    })
+  )
+)
+
+(define-read-only (get-global-gift-stats)
+  {
+    total-gifts-received: (var-get total-gifts-received)
+  }
 )
